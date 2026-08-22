@@ -4,6 +4,18 @@ LDFLAGS = -shared
 PAM_LIBS = -lpam -largon2
 CTL_LIBS = -largon2
 
+# Optional TPM 2.0 backend. Auto-detected via pkg-config; force with
+# TPM2=1 or disable with TPM2=0.
+TPM2_PCDEPS = tss2-esys tss2-mu tss2-tctildr
+TPM2 ?= $(shell pkg-config --exists $(TPM2_PCDEPS) 2>/dev/null && echo 1 || echo 0)
+ifeq ($(TPM2),1)
+    CFLAGS += -DHAVE_TPM2 $(shell pkg-config --cflags $(TPM2_PCDEPS))
+    TPM2_LIBS = $(shell pkg-config --libs $(TPM2_PCDEPS))
+    TPM2_SRC = pinlock_tpm2.c
+    PAM_LIBS += $(TPM2_LIBS)
+    CTL_LIBS += $(TPM2_LIBS)
+endif
+
 # Installation directories - auto-detect or use common defaults
 PAM_MODULE_DIR := $(shell find /lib* /usr/lib* -name "pam_unix.so" -exec dirname {} \; 2>/dev/null | head -1)
 ifeq ($(PAM_MODULE_DIR),)
@@ -18,11 +30,11 @@ EXAMPLEDIR = $(CONFDIR)/pinlock/examples
 # Targets
 all: pam_pinlock.so pinlockctl
 
-pam_pinlock.so: pam_pinlock.c pinlock_record.c pinlock_record.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ pam_pinlock.c pinlock_record.c $(PAM_LIBS)
+pam_pinlock.so: pam_pinlock.c pinlock_record.c pinlock_record.h $(TPM2_SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ pam_pinlock.c pinlock_record.c $(TPM2_SRC) $(PAM_LIBS)
 
-pinlockctl: pinlockctl.c pinlock_record.c pinlock_record.h
-	$(CC) $(CFLAGS) -o $@ pinlockctl.c pinlock_record.c $(CTL_LIBS)
+pinlockctl: pinlockctl.c pinlock_record.c pinlock_record.h $(TPM2_SRC)
+	$(CC) $(CFLAGS) -o $@ pinlockctl.c pinlock_record.c $(TPM2_SRC) $(CTL_LIBS)
 
 install: all
 	@echo "Installing to PAM directory: $(LIBDIR)"

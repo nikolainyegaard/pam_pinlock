@@ -20,6 +20,7 @@
 // Configuration structure
 typedef struct {
     char pin_dir[1024];
+    char tpm2_tcti[256];
     int min_length;
     int max_length;
     int require_digits_only;
@@ -82,6 +83,7 @@ static int prompt_pin(pam_handle_t *pamh, const char *prompt, char **out_pin) {
 // Load default config
 static void load_default_config(pinlock_config_t *config) {
     config->pin_dir[0] = '\0';
+    config->tpm2_tcti[0] = '\0';
     config->min_length = 6;
     config->max_length = 32;
     config->require_digits_only = 1;
@@ -165,6 +167,7 @@ static void load_config_file(const char *path, pinlock_config_t *config) {
         if (strcmp(key, "pin_dir") == 0) {
             if (!*value || *value == '/') snprintf(config->pin_dir, sizeof(config->pin_dir), "%s", value);
         }
+        else if (strcmp(key, "tpm2_tcti") == 0) snprintf(config->tpm2_tcti, sizeof(config->tpm2_tcti), "%s", value);
         else if (strcmp(key, "min_length") == 0 && parse_int_range(value, 1, 128, &parsed)) config->min_length = parsed;
         else if (strcmp(key, "max_length") == 0 && parse_int_range(value, 1, 128, &parsed)) config->max_length = parsed;
         else if (strcmp(key, "require_digits_only") == 0) config->require_digits_only = parse_bool(value);
@@ -215,6 +218,8 @@ static void parse_args(int argc, const char **argv, const char **prompt, int *re
             const char *dir = argv[i]+8;
             if (!*dir || *dir == '/') snprintf(config->pin_dir, sizeof(config->pin_dir), "%s", dir);
         }
+        else if(strncmp(argv[i],"tpm2_tcti=",10)==0)
+            snprintf(config->tpm2_tcti, sizeof(config->tpm2_tcti), "%s", argv[i]+10);
         else if(strncmp(argv[i],"retries=",8)==0) {
             int parsed = 0;
             if (parse_int_range(argv[i]+8, 1, 50, &parsed)) *retries = parsed;
@@ -476,11 +481,29 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
             continue; // re-prompt
         }
 
-        int v = pinlock_verify_pin(pin_path, pin);
+        int v = pinlock_verify_pin(pin_path, pin, config.tpm2_tcti);
         memwipe(pin, strlen(pin)); free(pin);
 
         if (v == PINLOCK_VERIFY_UNREADABLE)
             return PAM_IGNORE;
+
+        if (v == PINLOCK_VERIFY_UNAVAILABLE) {
+            // TPM record but no usable TPM (unreachable, cleared since
+            // enrollment, or module built without TPM support). Fall
+            // through to the next PAM method rather than lock out.
+            pam_syslog(pamh, LOG_WARNING,
+                       "pinlock: PIN record for %s requires a TPM that is not usable, skipping",
+                       user);
+            return PAM_IGNORE;
+        }
+
+        if (v == PINLOCK_VERIFY_LOCKOUT) {
+            if (config.log_failures)
+                pam_syslog(pamh, LOG_WARNING,
+                           "pinlock: TPM is in dictionary attack lockout, PIN unavailable for user %s",
+                           user);
+            return lockout_result(&config);
+        }
 
         if (v == PINLOCK_VERIFY_OK) {
             check_rate_limit(pamh, user, dir, &config, 1);

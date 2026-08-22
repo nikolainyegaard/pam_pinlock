@@ -17,6 +17,7 @@
 - 🛡️ **PAM Integration** — Works seamlessly with login, sudo, su, and any PAM-aware service
 - 🔐 **Secure PIN Authentication** — Fast, memorable authentication with enterprise-grade security
 - 🏋️ **Argon2id Hashing** — Industry-standard password hashing with unique salts per user
+- 🔏 **TPM 2.0 Sealing (optional)** — Hardware-backed PIN storage with no crackable hash on disk
 - 🛑 **Rate Limiting** — Built-in brute force protection with configurable attempt limits
 - 🔒 **PIN Lockout** — Optional temporary PIN lockout with configurable PAM failure behavior
 - ⚙️ **Flexible Configuration** — System-wide and per-user configuration files
@@ -43,7 +44,7 @@
 |-------------|-------------|
 | **OS** | Linux with PAM support (tested on Ubuntu, Fedora, Arch) |
 | **Compiler** | GCC 7+ or compatible C compiler |
-| **Libraries** | libpam-dev, libargon2-dev |
+| **Libraries** | libpam-dev, libargon2-dev; optional: tpm2-tss for TPM-sealed PINs |
 | **Build Tools** | make, git |
 | **Permissions** | sudo access for installation |
 
@@ -130,6 +131,10 @@ sudo nano /etc/pinlock.conf
 # Global pin_dir affects every PAM service. On mixed desktop systems, prefer
 # setting pin_dir= on individual PAM lines for sudo/polkit instead.
 # pin_dir=/var/lib/pinlock
+
+# TPM connection for TPM-sealed PINs (rarely needed)
+# Leave unset for the tpm2-tss library default, normally /dev/tpmrm0
+# tpm2_tcti=device:/dev/tpmrm0
 
 # User Configuration
 # Disabled by default so user config cannot weaken system policy
@@ -235,6 +240,33 @@ If polkit still falls back to password auth, temporarily enable `debug=yes` in `
 journalctl -b | grep pinlock
 ```
 Remove `debug` again after testing.
+
+---
+
+## 🔏 TPM-Sealed PINs (Optional)
+
+When built with TPM support, `pinlockctl` can seal a PIN in the system's TPM 2.0 chip instead of storing an argon2id hash on disk:
+
+```bash
+# Per-user store (screen lockers)
+pinlockctl --tpm set alice
+
+# Root-managed system store (sudo/polkit)
+sudo pinlockctl --tpm --pin-dir /var/lib/pinlock set alice
+```
+
+Why you might want this: PINs are short, so even a memory-hard hash cannot fully protect a stolen PIN file against offline guessing. A TPM-sealed record contains no hash at all. It can only be used on the physical TPM that created it, and the TPM's own dictionary attack lockout throttles wrong guesses in hardware, on top of the module's normal rate limiting. The PIN also never crosses the TPM bus in plaintext (verification uses salted, parameter-encrypted sessions).
+
+Requirements and behavior:
+
+- Build with tpm2-tss headers installed (Fedora: `tpm2-tss-devel`, Debian/Ubuntu: `libtss2-dev`, Arch: `tpm2-tss`). The Makefile auto-detects them; `make TPM2=0` builds without TPM support.
+- The process verifying the PIN needs access to the TPM device, normally `/dev/tpmrm0`. Root services (sudo, polkit) have it already. For user-run screen lockers the user may need membership in the `tss` group, depending on the distribution's udev rules.
+- TPM and argon2 records coexist freely. The record type is detected from the PIN file itself, so some users or services can use TPM sealing while others keep hashes.
+- TPM-sealed PINs are limited to 32 characters.
+- If the TPM is unreachable or has been cleared since enrollment (firmware reset, motherboard replacement), authentication falls through to the next PAM method instead of locking you out, and a warning is logged. Re-enroll with `pinlockctl --tpm set` after a TPM clear.
+- If the TPM enters dictionary attack lockout, the PIN is refused until the lockout expires or an administrator clears it (`tpm2_dictionarylockout --clear-lockout`). Note that the lockout counter is shared chip-wide with everything else using the TPM, including TPM-backed disk encryption.
+
+Sealing does not change file trust: anyone who can replace the PIN file can substitute a record sealed with a PIN they know. Keep using the root-managed system store for privilege escalation services.
 
 ---
 

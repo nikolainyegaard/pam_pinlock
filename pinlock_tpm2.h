@@ -1,0 +1,33 @@
+#ifndef PINLOCK_TPM2_H
+#define PINLOCK_TPM2_H
+
+// TPM 2.0 sealed-PIN backend. Compiled only when built with TPM2=1.
+//
+// Enrollment seals a random secret in a TPM object protected by the
+// TPM's dictionary attack lockout, with the PIN as its auth value.
+// Verification loads the sealed object and attempts TPM2_Unseal over
+// a salted, parameter-encrypted HMAC session, so the PIN never leaves
+// the host or crosses the TPM bus in plaintext. There is no hash on
+// disk to attack offline; the record is useless without the physical
+// TPM that created it.
+
+// A TPM PIN may not exceed the auth value limit of the sealed object.
+#define PINLOCK_TPM2_MAX_PIN 32
+
+// Probe for a usable TPM. Returns 1 if available, 0 if not.
+// tcti_conf selects the TPM connection (NULL or empty for the library
+// default, typically /dev/tpmrm0).
+int pinlock_tpm2_available(const char *tcti_conf);
+
+// Seal a new PIN into a TPM record. On success stores heap-allocated
+// record text (header line plus base64 blob lines, newline-terminated)
+// in *record_out and returns 0. Returns -1 on any failure.
+int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, char **record_out);
+
+// Verify a PIN against TPM record text. Returns the PINLOCK_VERIFY_*
+// codes from pinlock_record.h: OK, FAIL (wrong PIN), LOCKOUT (TPM is
+// in dictionary attack lockout), or UNAVAILABLE (TPM unreachable, or
+// the record does not belong to this TPM).
+int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const char *pin);
+
+#endif

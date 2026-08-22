@@ -11,10 +11,14 @@
 #include <ctype.h>
 
 #include "pinlock_record.h"
+#ifdef HAVE_TPM2
+#include "pinlock_tpm2.h"
+#endif
 
 // Configuration structure (same as PAM module)
 typedef struct {
     char pin_dir[1024];
+    char tpm2_tcti[256];
     int min_length;
     int max_length;
     int require_digits_only;
@@ -37,6 +41,7 @@ static void usage(const char *prog) {
     printf("Usage: %s [--pin-dir DIR] <command> [username]\n", prog);
     printf("Options:\n");
     printf("  --pin-dir DIR   Override PIN storage directory for this command\n");
+    printf("  --tpm           Seal the PIN in the TPM instead of storing a hash (enroll/set)\n");
     printf("Commands:\n");
     printf("  enroll, set    Set a new PIN for the user\n");
     printf("  remove         Remove the PIN for the user\n");
@@ -167,6 +172,7 @@ static char *prompt_hidden(const char *label) {
 
 static void load_default_config(pinlock_config_t *config) {
     config->pin_dir[0] = '\0';
+    config->tpm2_tcti[0] = '\0';
     config->min_length = 6;
     config->max_length = 32;
     config->require_digits_only = 1;
@@ -253,6 +259,7 @@ static void load_config_file(const char *path, pinlock_config_t *config) {
         if (strcmp(key, "pin_dir") == 0) {
             if (!*value || *value == '/') snprintf(config->pin_dir, sizeof(config->pin_dir), "%s", value);
         }
+        else if (strcmp(key, "tpm2_tcti") == 0) snprintf(config->tpm2_tcti, sizeof(config->tpm2_tcti), "%s", value);
         else if (strcmp(key, "min_length") == 0 && parse_int_range(value, 1, 128, &parsed)) config->min_length = parsed;
         else if (strcmp(key, "max_length") == 0 && parse_int_range(value, 1, 128, &parsed)) config->max_length = parsed;
         else if (strcmp(key, "require_digits_only") == 0) config->require_digits_only = parse_bool(value);
@@ -442,8 +449,14 @@ int main(int argc, char **argv) {
     if (argc < 2) usage(argv[0]);
 
     const char *pin_dir_override = NULL;
+    int use_tpm = 0;
     int cmd_index = 1;
     while (cmd_index < argc) {
+        if (strcmp(argv[cmd_index], "--tpm") == 0) {
+            use_tpm = 1;
+            cmd_index++;
+            continue;
+        }
         if (strcmp(argv[cmd_index], "--pin-dir") == 0) {
             if (cmd_index + 1 >= argc) {
                 fprintf(stderr, "--pin-dir requires an absolute directory path\n");
@@ -580,14 +593,38 @@ int main(int argc, char **argv) {
         }
 
         char *encoded = NULL;
-        int argon2_rc = 0;
-        int rc = pinlock_record_create_argon2(p1, &encoded, &argon2_rc);
-        if (rc == -1) die("urandom");
-        if (rc == -2) die("malloc");
-        if (rc != 0) {
-            fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", argon2_rc);
+        if (use_tpm) {
+#ifdef HAVE_TPM2
+            if (strlen(p1) > PINLOCK_TPM2_MAX_PIN) {
+                fprintf(stderr, "TPM-sealed PINs may be at most %d characters\n", PINLOCK_TPM2_MAX_PIN);
+                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
+                free(p1); free(p2); free(user); return 1;
+            }
+            if (!pinlock_tpm2_available(config.tpm2_tcti)) {
+                fprintf(stderr, "No usable TPM 2.0 found (check tpm2_tcti in /etc/pinlock.conf and /dev/tpmrm0 access)\n");
+                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
+                free(p1); free(p2); free(user); return 1;
+            }
+            if (pinlock_tpm2_seal(config.tpm2_tcti, p1, &encoded) != 0) {
+                fprintf(stderr, "Failed to seal PIN in the TPM\n");
+                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
+                free(p1); free(p2); free(user); return 1;
+            }
+#else
+            fprintf(stderr, "This build has no TPM support (rebuild with TPM2=1 and tpm2-tss headers)\n");
             memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
             free(p1); free(p2); free(user); return 1;
+#endif
+        } else {
+            int argon2_rc = 0;
+            int rc = pinlock_record_create_argon2(p1, &encoded, &argon2_rc);
+            if (rc == -1) die("urandom");
+            if (rc == -2) die("malloc");
+            if (rc != 0) {
+                fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", argon2_rc);
+                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
+                free(p1); free(p2); free(user); return 1;
+            }
         }
 
         if (write_file_restrict(dir, path, encoded, pw, system_pin_dir_enabled(&config))!=0) die("write pin file");
@@ -601,6 +638,7 @@ int main(int argc, char **argv) {
 
         printf("PIN successfully set for user '%s'\n", user);
         printf("Configuration applied:\n");
+        printf("  - Storage: %s\n", use_tpm ? "TPM-sealed record" : "argon2id hash");
         printf("  - Length requirement: %d-%d characters\n", config.min_length, config.max_length);
         printf("  - Digits only: %s\n", config.require_digits_only ? "yes" : "no");
         printf("  - Rate limiting: %d attempts per %d seconds\n", config.max_attempts, config.rate_limit_window);
