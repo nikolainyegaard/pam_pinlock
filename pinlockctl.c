@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#include <argon2.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
@@ -10,6 +9,8 @@
 #include <termios.h>
 #include <unistd.h>
 #include <ctype.h>
+
+#include "pinlock_record.h"
 
 // Configuration structure (same as PAM module)
 typedef struct {
@@ -578,22 +579,15 @@ int main(int argc, char **argv) {
             free(p1); free(p2); free(user); return 1; 
         }
 
-        unsigned char salt[16];
-        int rnd = open("/dev/urandom", O_RDONLY);
-        if (rnd<0 || read(rnd, salt, sizeof(salt))!=(ssize_t)sizeof(salt)) die("urandom");
-        close(rnd);
-
-        unsigned long t_cost=3, m_cost=1u<<16, parallel=1;
-        size_t enc_len = argon2_encodedlen(t_cost, m_cost, parallel, sizeof(salt), 32, Argon2_id);
-        char *encoded = malloc(enc_len);
-        if (!encoded) die("malloc");
-
-        int rc = argon2id_hash_encoded((uint32_t)t_cost,(uint32_t)m_cost,(uint32_t)parallel,
-                                       p1, strlen(p1), salt, sizeof(salt), 32, encoded, enc_len);
-        if (rc!=ARGON2_OK) { 
-            fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", rc);
+        char *encoded = NULL;
+        int argon2_rc = 0;
+        int rc = pinlock_record_create_argon2(p1, &encoded, &argon2_rc);
+        if (rc == -1) die("urandom");
+        if (rc == -2) die("malloc");
+        if (rc != 0) {
+            fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", argon2_rc);
             memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-            free(encoded); free(p1); free(p2); free(user); return 1; 
+            free(p1); free(p2); free(user); return 1;
         }
 
         if (write_file_restrict(dir, path, encoded, pw, system_pin_dir_enabled(&config))!=0) die("write pin file");

@@ -8,13 +8,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <argon2.h>
 #include <syslog.h>
 #include <pwd.h>
 #include <time.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
+
+#include "pinlock_record.h"
 
 // Configuration structure
 typedef struct {
@@ -55,24 +56,7 @@ static void memwipe(void *v, size_t n) {
     while(n--) *p++=0;
 }
 
-// Read first line from file
-static int read_first_line(const char *path, char **out) {
-    *out = NULL;
-#ifdef O_NOFOLLOW
-    int fd = open(path, O_RDONLY|O_NOFOLLOW);
-#else
-    int fd = open(path, O_RDONLY);
-#endif
-    if (fd < 0) return -1;
-    FILE *f = fdopen(fd,"r");
-    if(!f) { close(fd); return -1; }
-    size_t cap=0; ssize_t n=getline(out,&cap,f); fclose(f);
-    if(n<=0) { free(*out); *out=NULL; return -1; }
-    while(n>0 && ((*out)[n-1]=='\n'||(*out)[n-1]=='\r')) (*out)[--n]=0;
-    return 0;
-}
-
-static int file_exists(const char *path) { 
+static int file_exists(const char *path) {
     struct stat st; 
     return stat(path,&st)==0 && S_ISREG(st.st_mode); 
 }
@@ -492,17 +476,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
             continue; // re-prompt
         }
 
-        char *encoded = NULL;
-        if (read_first_line(pin_path, &encoded) != 0 || !encoded) {
-            memwipe(pin, strlen(pin));
-            free(pin);
+        int v = pinlock_verify_pin(pin_path, pin);
+        memwipe(pin, strlen(pin)); free(pin);
+
+        if (v == PINLOCK_VERIFY_UNREADABLE)
             return PAM_IGNORE;
-        }
 
-        int v = argon2id_verify(encoded, pin, strlen(pin));
-        memwipe(pin, strlen(pin)); free(pin); free(encoded);
-
-        if (v == ARGON2_OK) {
+        if (v == PINLOCK_VERIFY_OK) {
             check_rate_limit(pamh, user, dir, &config, 1);
             if (config.log_success)
                 pam_syslog(pamh, LOG_INFO,

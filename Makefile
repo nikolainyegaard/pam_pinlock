@@ -18,11 +18,11 @@ EXAMPLEDIR = $(CONFDIR)/pinlock/examples
 # Targets
 all: pam_pinlock.so pinlockctl
 
-pam_pinlock.so: pam_pinlock.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(PAM_LIBS)
+pam_pinlock.so: pam_pinlock.c pinlock_record.c pinlock_record.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ pam_pinlock.c pinlock_record.c $(PAM_LIBS)
 
-pinlockctl: pinlockctl.c
-	$(CC) $(CFLAGS) -o $@ $< $(CTL_LIBS)
+pinlockctl: pinlockctl.c pinlock_record.c pinlock_record.h
+	$(CC) $(CFLAGS) -o $@ pinlockctl.c pinlock_record.c $(CTL_LIBS)
 
 install: all
 	@echo "Installing to PAM directory: $(LIBDIR)"
