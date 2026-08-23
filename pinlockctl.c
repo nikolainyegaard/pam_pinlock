@@ -548,6 +548,11 @@ int main(int argc, char **argv) {
             printf("  Failed attempts counted: %u of %u\n", info.lockout_counter, info.max_auth_fail);
             printf("  Counter decrement interval: %u seconds\n", info.lockout_interval);
             printf("  Lockout recovery time: %u seconds\n", info.lockout_recovery);
+            if (info.lockout_auth_set)
+                printf("  Note: the TPM lockout hierarchy has an auth value set (often by a\n"
+                       "  previously installed OS). If it is unknown, the counter cannot be\n"
+                       "  cleared manually; it heals on its own, or clear the TPM from the\n"
+                       "  firmware setup menu (this orphans all TPM records, re-enroll after).\n");
         }
         if (access(path, F_OK) != 0) {
             printf("PIN record for '%s': none\n", user);

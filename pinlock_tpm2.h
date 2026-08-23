@@ -25,6 +25,9 @@ int pinlock_tpm2_available(const char *tcti_conf);
 // chip-global, shared with every other user of this TPM.
 typedef struct {
     int in_lockout;
+    int lockout_auth_set;       // lockout hierarchy has an auth value; if
+                                // it is unknown (set by a previous OS),
+                                // the counter cannot be cleared manually
     uint32_t lockout_counter;   // failed auth attempts currently counted
     uint32_t max_auth_fail;     // failures that trigger lockout
     uint32_t lockout_interval;  // seconds until the counter decrements

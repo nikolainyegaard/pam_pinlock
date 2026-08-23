@@ -269,6 +269,7 @@ Requirements and behavior:
 - TPM-sealed PINs are limited to 32 characters.
 - If the TPM is unreachable or has been cleared since enrollment (firmware reset, motherboard replacement), authentication falls through to the next PAM method instead of locking you out, and a warning is logged. Re-enroll with `pinlockctl --tpm set` after a TPM clear.
 - If the TPM enters dictionary attack lockout, the PIN is refused until the lockout expires or an administrator clears it (`tpm2_dictionarylockout --clear-lockout`). Note that the lockout counter is shared chip-wide with everything else using the TPM, including TPM-backed disk encryption.
+- On machines that previously ran Windows, the TPM lockout hierarchy usually has an auth value set that Linux does not know, so the lockout cannot be cleared manually; it heals on its own per the recovery time. `pinlockctl tpm-status` warns when this is the case. Clearing the TPM from the firmware setup menu resets it (and orphans all TPM records; re-enroll afterwards).
 
 Sealing does not change file trust: anyone who can replace the PIN file can substitute a record sealed with a PIN they know. Keep using the root-managed system store for privilege escalation services.
 

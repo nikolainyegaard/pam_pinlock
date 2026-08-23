@@ -231,7 +231,10 @@ int pinlock_tpm2_da_info(const char *tcti_conf, pinlock_tpm2_da_info_t *info) {
         case TPM2_PT_MAX_AUTH_FAIL:    info->max_auth_fail = p->value; break;
         case TPM2_PT_LOCKOUT_INTERVAL: info->lockout_interval = p->value; break;
         case TPM2_PT_LOCKOUT_RECOVERY: info->lockout_recovery = p->value; break;
-        case TPM2_PT_PERMANENT:        info->in_lockout = (p->value & TPMA_PERMANENT_INLOCKOUT) != 0; break;
+        case TPM2_PT_PERMANENT:
+            info->in_lockout = (p->value & TPMA_PERMANENT_INLOCKOUT) != 0;
+            info->lockout_auth_set = (p->value & TPMA_PERMANENT_LOCKOUTAUTHSET) != 0;
+            break;
         }
     }
     Esys_Free(cap);
