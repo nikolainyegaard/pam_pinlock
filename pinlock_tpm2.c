@@ -56,52 +56,6 @@ static int classify_rc(TSS2_RC rc) {
     return PINLOCK_VERIFY_UNAVAILABLE;
 }
 
-/* ---------- base64 ---------- */
-
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static char *b64_encode(const uint8_t *in, size_t len) {
-    size_t olen = 4 * ((len + 2) / 3);
-    char *out = malloc(olen + 1);
-    if (!out) return NULL;
-    size_t i, o = 0;
-    for (i = 0; i + 2 < len; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16 | (uint32_t)in[i+1] << 8 | in[i+2];
-        out[o++] = B64[v >> 18]; out[o++] = B64[(v >> 12) & 63];
-        out[o++] = B64[(v >> 6) & 63]; out[o++] = B64[v & 63];
-    }
-    if (i < len) {
-        uint32_t v = (uint32_t)in[i] << 16;
-        int rem = (int)(len - i);
-        if (rem == 2) v |= (uint32_t)in[i+1] << 8;
-        out[o++] = B64[v >> 18]; out[o++] = B64[(v >> 12) & 63];
-        out[o++] = rem == 2 ? B64[(v >> 6) & 63] : '=';
-        out[o++] = '=';
-    }
-    out[o] = '\0';
-    return out;
-}
-
-static int b64_decode(const char *in, size_t inlen, uint8_t *out, size_t cap, size_t *outlen) {
-    size_t o = 0;
-    uint32_t v = 0;
-    int bits = 0;
-    for (size_t i = 0; i < inlen; i++) {
-        if (in[i] == '=') break;
-        const char *p = strchr(B64, in[i]);
-        if (!p || !in[i]) return -1;
-        v = v << 6 | (uint32_t)(p - B64);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            if (o >= cap) return -1;
-            out[o++] = (uint8_t)(v >> bits);
-        }
-    }
-    *outlen = o;
-    return 0;
-}
-
 /* ---------- TPM plumbing ---------- */
 
 static TSS2_RC open_ctx(const char *tcti_conf, ESYS_CONTEXT **ctx, TSS2_TCTI_CONTEXT **tcti) {
@@ -186,27 +140,59 @@ static int pin_to_auth(const char *pin, TPM2B_AUTH *auth) {
 
 /* ---------- record text ---------- */
 
-// Record layout: PINLOCK_TPM2_HEADER, then base64 TPM2B_PUBLIC, then
-// base64 TPM2B_PRIVATE, one per line.
+// Record layout, one item per line: header, base64 TPM2B_PUBLIC, base64
+// TPM2B_PRIVATE. v2 sso records add three lines: kdf salt, wrapped key,
+// password blob (see pinlock_sso_wrap). sso_version is 0, 1, or 2; for
+// version 2 the password blob line is duplicated into *pwblob_b64
+// (heap, caller frees).
 
-static int parse_record(const char *text, TPM2B_PUBLIC *pub, TPM2B_PRIVATE *priv, int *sso) {
-    const char *l1 = strchr(text, '\n');
-    if (!l1) return -1;
-    *sso = (size_t)(l1 - text) == strlen(PINLOCK_TPM2_HEADER_SSO)
-        && strncmp(text, PINLOCK_TPM2_HEADER_SSO, strlen(PINLOCK_TPM2_HEADER_SSO)) == 0;
-    const char *l2 = strchr(l1 + 1, '\n');
-    if (!l2) return -1;
-    const char *end = strchr(l2 + 1, '\n');
-    if (!end) end = l2 + 1 + strlen(l2 + 1);
+static int parse_record(const char *text, TPM2B_PUBLIC *pub, TPM2B_PRIVATE *priv,
+                        int *sso_version, char **pwblob_b64) {
+    *sso_version = 0;
+    *pwblob_b64 = NULL;
+
+    // Split into up to 6 lines without modifying text.
+    const char *ls[6];
+    size_t ll[6];
+    int n = 0;
+    const char *p = text;
+    while (n < 6 && *p) {
+        ls[n] = p;
+        const char *nl = strchr(p, '\n');
+        ll[n] = nl ? (size_t)(nl - p) : strlen(p);
+        n++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    if (n < 3) return -1;
+
+    if (ll[0] == strlen(PINLOCK_TPM2_HEADER)
+            && strncmp(ls[0], PINLOCK_TPM2_HEADER, ll[0]) == 0)
+        *sso_version = 0;
+    else if (ll[0] == strlen(PINLOCK_TPM2_HEADER_SSO)
+            && strncmp(ls[0], PINLOCK_TPM2_HEADER_SSO, ll[0]) == 0)
+        *sso_version = 1;
+    else if (ll[0] == strlen(PINLOCK_TPM2_HEADER_V2_SSO)
+            && strncmp(ls[0], PINLOCK_TPM2_HEADER_V2_SSO, ll[0]) == 0)
+        *sso_version = 2;
+    else
+        return -1;
 
     uint8_t pbuf[sizeof(TPM2B_PUBLIC)], sbuf[sizeof(TPM2B_PRIVATE)];
     size_t plen, slen, off;
-    if (b64_decode(l1 + 1, (size_t)(l2 - l1 - 1), pbuf, sizeof(pbuf), &plen) != 0) return -1;
-    if (b64_decode(l2 + 1, (size_t)(end - l2 - 1), sbuf, sizeof(sbuf), &slen) != 0) return -1;
+    if (pinlock_b64_decode(ls[1], ll[1], pbuf, sizeof(pbuf), &plen) != 0) return -1;
+    if (pinlock_b64_decode(ls[2], ll[2], sbuf, sizeof(sbuf), &slen) != 0) return -1;
     off = 0;
     if (Tss2_MU_TPM2B_PUBLIC_Unmarshal(pbuf, plen, &off, pub) != TSS2_RC_SUCCESS) return -1;
     off = 0;
     if (Tss2_MU_TPM2B_PRIVATE_Unmarshal(sbuf, slen, &off, priv) != TSS2_RC_SUCCESS) return -1;
+
+    if (*sso_version == 2) {
+        if (n < 6) return -1;
+        char *dup = strndup(ls[5], ll[5]);
+        if (!dup) return -1;
+        *pwblob_b64 = dup;
+    }
     return 0;
 }
 
@@ -264,7 +250,7 @@ int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, const char *sso_pa
 
     size_t sso_len = sso_password ? strlen(sso_password) : 0;
     if (sso_len > PINLOCK_TPM2_MAX_SSO || (sso_password && sso_len == 0)) return -1;
-    const char *header = sso_password ? PINLOCK_TPM2_HEADER_SSO : PINLOCK_TPM2_HEADER;
+    const char *header = sso_password ? PINLOCK_TPM2_HEADER_V2_SSO : PINLOCK_TPM2_HEADER;
 
     TPM2B_AUTH auth = {0};
     if (pin_to_auth(pin, &auth) != 0) return -1;
@@ -296,14 +282,13 @@ int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, const char *sso_pa
             .parameters.keyedHashDetail.scheme.scheme = TPM2_ALG_NULL,
         },
     };
+    // The sealed payload is always a random key. For sso records the
+    // account password is stored encrypted under it (extra record
+    // lines), never inside the TPM blob itself, so a password change
+    // can update the record without resealing.
     sens.sensitive.userAuth = auth;
-    if (sso_password) {
-        sens.sensitive.data.size = (UINT16)sso_len;
-        memcpy(sens.sensitive.data.buffer, sso_password, sso_len);
-    } else {
-        sens.sensitive.data.size = TPM2_SECRET_LEN;
-        if (getrandom(sens.sensitive.data.buffer, TPM2_SECRET_LEN, 0) != TPM2_SECRET_LEN) goto out;
-    }
+    sens.sensitive.data.size = TPM2_SECRET_LEN;
+    if (getrandom(sens.sensitive.data.buffer, TPM2_SECRET_LEN, 0) != TPM2_SECRET_LEN) goto out;
 
     TPM2B_DATA outside = {0};
     TPML_PCR_SELECTION pcrs = {0};
@@ -317,19 +302,32 @@ int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, const char *sso_pa
     if (Tss2_MU_TPM2B_PUBLIC_Marshal(out_pub, pbuf, sizeof(pbuf), &poff) != TSS2_RC_SUCCESS) goto out;
     if (Tss2_MU_TPM2B_PRIVATE_Marshal(out_priv, sbuf, sizeof(sbuf), &soff) != TSS2_RC_SUCCESS) goto out;
 
-    char *p64 = b64_encode(pbuf, poff);
-    char *s64 = b64_encode(sbuf, soff);
-    if (p64 && s64) {
+    char *p64 = pinlock_b64_encode(pbuf, poff);
+    char *s64 = pinlock_b64_encode(sbuf, soff);
+    char *salt64 = NULL, *kwrap64 = NULL, *pwblob64 = NULL;
+    int wrap_ok = !sso_password
+        || pinlock_sso_wrap(sens.sensitive.data.buffer, sso_password,
+                            &salt64, &kwrap64, &pwblob64) == 0;
+    if (p64 && s64 && wrap_ok) {
         size_t need = strlen(header) + strlen(p64) + strlen(s64) + 4;
+        if (sso_password)
+            need += strlen(salt64) + strlen(kwrap64) + strlen(pwblob64) + 3;
         char *record = malloc(need);
         if (record) {
-            snprintf(record, need, "%s\n%s\n%s\n", header, p64, s64);
+            if (sso_password)
+                snprintf(record, need, "%s\n%s\n%s\n%s\n%s\n%s\n",
+                         header, p64, s64, salt64, kwrap64, pwblob64);
+            else
+                snprintf(record, need, "%s\n%s\n%s\n", header, p64, s64);
             *record_out = record;
             ret = 0;
         }
     }
     free(p64);
     free(s64);
+    free(salt64);
+    free(kwrap64);
+    free(pwblob64);
 
     // Best effort: make sure the SRK is persisted where verification
     // will find it, so it skips the expensive primary creation. A slot
@@ -381,12 +379,13 @@ out:
 
 // One unseal attempt under a given parent. Sets *load_integrity when
 // Load failed because the blob was not sealed under this parent key.
-// When secret_out is non-NULL, a successful unseal stores the payload
-// there as a NUL-terminated heap string (caller wipes and frees).
+// When secret_out is non-NULL, a successful unseal stores the raw
+// payload there (heap, NUL-padded, length in *secret_len; caller wipes
+// and frees).
 static int unseal_under_parent(ESYS_CONTEXT *ctx, ESYS_TR parent,
                                const TPM2B_PUBLIC *pub, const TPM2B_PRIVATE *priv,
                                const TPM2B_AUTH *auth, int *load_integrity,
-                               char **secret_out) {
+                               unsigned char **secret_out, size_t *secret_len) {
     *load_integrity = 0;
     ESYS_TR session = ESYS_TR_NONE, obj = ESYS_TR_NONE;
 
@@ -415,10 +414,11 @@ static int unseal_under_parent(ESYS_CONTEXT *ctx, ESYS_TR parent,
 
     if (rc == TSS2_RC_SUCCESS) {
         if (secret_out) {
-            char *copy = malloc((size_t)secret->size + 1);
+            unsigned char *copy = malloc((size_t)secret->size + 1);
             if (copy) {
                 memcpy(copy, secret->buffer, secret->size);
                 copy[secret->size] = '\0';
+                *secret_len = secret->size;
             }
             *secret_out = copy;
         }
@@ -440,17 +440,22 @@ int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const ch
 
     TPM2B_PUBLIC pub;
     TPM2B_PRIVATE priv;
-    int sso = 0;
-    if (parse_record(record_text, &pub, &priv, &sso) != 0) {
+    int sso_version = 0;
+    char *pwblob64 = NULL;
+    if (parse_record(record_text, &pub, &priv, &sso_version, &pwblob64) != 0) {
         wipe(&auth, sizeof(auth));
         return PINLOCK_VERIFY_UNAVAILABLE;
     }
-    char **secret_out = (sso && sso_secret_out) ? sso_secret_out : NULL;
+
+    unsigned char *payload = NULL;
+    size_t payload_len = 0;
+    unsigned char **want_payload = (sso_version && sso_secret_out) ? &payload : NULL;
 
     ESYS_CONTEXT *ctx = NULL;
     TSS2_TCTI_CONTEXT *tcti = NULL;
     if (open_ctx(tcti_conf, &ctx, &tcti) != TSS2_RC_SUCCESS) {
         wipe(&auth, sizeof(auth));
+        free(pwblob64);
         return PINLOCK_VERIFY_UNAVAILABLE;
     }
 
@@ -466,7 +471,8 @@ int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const ch
         rc = Esys_TR_FromTPMPublic(ctx, srk_slots[i],
                                    ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &parent);
         if (rc != TSS2_RC_SUCCESS) continue;
-        result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity, secret_out);
+        result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity,
+                                     want_payload, &payload_len);
         Esys_TR_Close(ctx, &parent);
         if (result != PINLOCK_VERIFY_UNAVAILABLE || !load_integrity)
             goto out;
@@ -478,10 +484,28 @@ int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const ch
         result = classify_rc(rc);
         goto out;
     }
-    result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity, secret_out);
+    result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity,
+                                 want_payload, &payload_len);
     Esys_FlushContext(ctx, parent);
 
 out:
+    if (result == PINLOCK_VERIFY_OK && payload) {
+        if (sso_version == 1) {
+            // Legacy record: the payload is the password itself.
+            *sso_secret_out = (char *)payload;
+            payload = NULL;
+        } else if (sso_version == 2 && payload_len == TPM2_SECRET_LEN && pwblob64) {
+            // A failed unwrap leaves *sso_secret_out NULL: the PIN is
+            // still correct, wallet unlocking just will not happen
+            // (stale record; re-enroll with --sso repairs it).
+            pinlock_sso_unwrap_password(payload, pwblob64, sso_secret_out);
+        }
+    }
+    if (payload) {
+        wipe(payload, payload_len);
+        free(payload);
+    }
+    free(pwblob64);
     wipe(&auth, sizeof(auth));
     close_ctx(&ctx, &tcti);
     return result;

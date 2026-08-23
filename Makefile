@@ -5,8 +5,9 @@ PAM_LIBS = -lpam -largon2
 CTL_LIBS = -largon2
 
 # Optional TPM 2.0 backend. Auto-detected via pkg-config; force with
-# TPM2=1 or disable with TPM2=0.
-TPM2_PCDEPS = tss2-esys tss2-mu tss2-tctildr
+# TPM2=1 or disable with TPM2=0. libcrypto handles the sso record
+# wrapping and is already a dependency of tpm2-tss itself.
+TPM2_PCDEPS = tss2-esys tss2-mu tss2-tctildr libcrypto
 TPM2 ?= $(shell pkg-config --exists $(TPM2_PCDEPS) 2>/dev/null && echo 1 || echo 0)
 ifeq ($(TPM2),1)
     CFLAGS += -DHAVE_TPM2 $(shell pkg-config --cflags $(TPM2_PCDEPS))

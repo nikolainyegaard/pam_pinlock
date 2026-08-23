@@ -575,3 +575,65 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh,int flags,int argc,const char *
     (void)pamh;(void)flags;(void)argc;(void)argv;
     return PAM_IGNORE;
 }
+
+// Password change hook. When the account password changes, a v2 sso
+// record is rewrapped in place with the new password, so PIN sign-in
+// keeps unlocking KWallet and friends without re-enrollment. Wire as
+// "password optional pam_pinlock.so" after pam_unix, which leaves the
+// old and new password in PAM_OLDAUTHTOK/PAM_AUTHTOK. Always returns
+// PAM_IGNORE: a PIN record must never block a password change.
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    if (!(flags & PAM_UPDATE_AUTHTOK)) return PAM_IGNORE;
+#ifdef HAVE_TPM2
+    const char *user = NULL;
+    if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || !user || !*user)
+        return PAM_IGNORE;
+
+    pinlock_config_t config;
+    load_config(user, &config);
+    const char *prompt = NULL;
+    int retries = 1, forward_pass = 0;
+    parse_args(argc, argv, &prompt, &retries, &forward_pass, &config);
+
+    const char *dir = get_pinlock_dir(user, &config);
+    if (!dir) return PAM_IGNORE;
+    char pin_path[1024];
+    int n = snprintf(pin_path, sizeof(pin_path), "%s/%s.pin", dir, user);
+    if (n < 0 || n >= (int)sizeof(pin_path) || !file_exists(pin_path)) return PAM_IGNORE;
+
+    const void *newpw = NULL, *oldpw = NULL;
+    pam_get_item(pamh, PAM_AUTHTOK, &newpw);
+    pam_get_item(pamh, PAM_OLDAUTHTOK, &oldpw);
+    if (!newpw || !*(const char *)newpw) return PAM_IGNORE;
+
+    if (!oldpw || !*(const char *)oldpw) {
+        // Administrative reset (passwd run by root): the old password
+        // is unknown, so the record cannot be rewrapped.
+        if (pinlock_record_type_of_file(pin_path) == PINLOCK_RECORD_TPM2)
+            pam_syslog(pamh, LOG_NOTICE,
+                       "pinlock: password for %s changed without the old password; "
+                       "if the PIN record seals the password, re-enroll with pinlockctl --sso",
+                       user);
+        return PAM_IGNORE;
+    }
+
+    switch (pinlock_record_update_password(pin_path, oldpw, newpw)) {
+    case 0:
+        pam_syslog(pamh, LOG_INFO, "pinlock: rewrapped sso record for %s after password change", user);
+        break;
+    case 1:
+        pam_syslog(pamh, LOG_NOTICE,
+                   "pinlock: sso record for %s did not match the old password; "
+                   "re-enroll with pinlockctl --sso to restore wallet unlocking", user);
+        break;
+    case 2:
+        break; // not an sso record, nothing to keep in sync
+    default:
+        pam_syslog(pamh, LOG_WARNING, "pinlock: could not rewrap sso record for %s", user);
+        break;
+    }
+#else
+    (void)argc; (void)argv;
+#endif
+    return PAM_IGNORE;
+}

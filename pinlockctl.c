@@ -73,6 +73,8 @@ static void usage(const char *prog) {
     printf("  --no-sso        Never offer to seal the account password\n");
     printf("Commands:\n");
     printf("  enroll, set    Set a new PIN for the user\n");
+    printf("  change         Change the PIN (asks for the current PIN first)\n");
+    printf("  reset          Reset a forgotten PIN using the account password\n");
     printf("  remove         Remove the PIN for the user\n");
     printf("  status         Show whether a PIN is set\n");
     printf("  tpm-status     Show TPM availability and dictionary attack lockout state\n");
@@ -347,6 +349,99 @@ static int validate_pin(const char *pin, const pinlock_config_t *config) {
     }
     
     return 1;
+}
+
+// Prompt for a new PIN with confirmation; returns a validated heap
+// string or NULL after printing the reason (caller wipes and frees).
+static char *prompt_new_pin(const pinlock_config_t *config) {
+    char *p1 = prompt_hidden("Enter new PIN: ");
+    if (!p1 || !*p1) {
+        fprintf(stderr, "No PIN entered.\n");
+        free(p1);
+        return NULL;
+    }
+    if (!validate_pin(p1, config)) {
+        fprintf(stderr, "PIN does not meet requirements:\n");
+        fprintf(stderr, "  - Length: %d-%d characters\n", config->min_length, config->max_length);
+        if (config->require_digits_only)
+            fprintf(stderr, "  - Must contain only digits (0-9)\n");
+        memset(p1, 0, strlen(p1));
+        free(p1);
+        return NULL;
+    }
+    char *p2 = prompt_hidden("Confirm PIN: ");
+    if (!p2 || strcmp(p1, p2) != 0) {
+        fprintf(stderr, "PINs do not match.\n");
+        memset(p1, 0, strlen(p1));
+        if (p2) memset(p2, 0, strlen(p2));
+        free(p1);
+        free(p2);
+        return NULL;
+    }
+    memset(p2, 0, strlen(p2));
+    free(p2);
+    return p1;
+}
+
+// True when the record header carries the sso marker.
+static int record_is_sso(const char *path) {
+    char first[64];
+#ifdef O_NOFOLLOW
+    int fd = open(path, O_RDONLY|O_NOFOLLOW);
+#else
+    int fd = open(path, O_RDONLY);
+#endif
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, first, sizeof(first) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    first[n] = '\0';
+    first[strcspn(first, "\r\n")] = '\0';
+    size_t len = strlen(first);
+    return len >= 4 && strcmp(first + len - 4, " sso") == 0;
+}
+
+// Build a record for the chosen backend, printing the reason on
+// failure. A non-NULL sso_pw also seals the account password (TPM
+// records only; the caller has already verified it).
+static char *make_record(const pinlock_config_t *config, const char *pin, const char *sso_pw, int use_tpm) {
+    char *encoded = NULL;
+    if (use_tpm) {
+#ifdef HAVE_TPM2
+        if (strlen(pin) > PINLOCK_TPM2_MAX_PIN) {
+            fprintf(stderr, "TPM-sealed PINs may be at most %d characters\n", PINLOCK_TPM2_MAX_PIN);
+            return NULL;
+        }
+        if (!pinlock_tpm2_available(config->tpm2_tcti)) {
+            fprintf(stderr, "No usable TPM 2.0 found (check tpm2_tcti in /etc/pinlock.conf and /dev/tpmrm0 access)\n");
+            return NULL;
+        }
+        if (pinlock_tpm2_seal(config->tpm2_tcti, pin, sso_pw, &encoded) != 0) {
+            fprintf(stderr, "Failed to seal PIN in the TPM\n");
+            return NULL;
+        }
+        return encoded;
+#else
+        (void)sso_pw;
+        fprintf(stderr, "This build has no TPM support (rebuild with TPM2=1 and tpm2-tss headers)\n");
+        return NULL;
+#endif
+    }
+    int argon2_rc = 0;
+    int rc = pinlock_record_create_argon2(pin, &encoded, &argon2_rc);
+    if (rc == -1) die("urandom");
+    if (rc == -2) die("malloc");
+    if (rc != 0) {
+        fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", argon2_rc);
+        return NULL;
+    }
+    return encoded;
+}
+
+static void clear_rate_limit(const char *dir, const char *user) {
+    char rl_path[1024];
+    int n = snprintf(rl_path, sizeof(rl_path), "%s/%s.ratelimit", dir, user);
+    if (n >= 0 && n < (int)sizeof(rl_path)) unlink(rl_path);
 }
 
 static int check_pin_dir_security(const char *dir, const struct passwd *pw, const pinlock_config_t *config, int verbose) {
@@ -656,6 +751,119 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (!strcmp(cmd, "change")) {
+        if (access(path, F_OK) != 0) {
+            fprintf(stderr, "No PIN set for user '%s'\n", user);
+            free(user);
+            return 1;
+        }
+        char *cur = prompt_hidden("Current PIN: ");
+        if (!cur || !*cur) {
+            fprintf(stderr, "No PIN entered.\n");
+            free(cur);
+            free(user);
+            return 1;
+        }
+        char *sso_secret = NULL;
+        int v = pinlock_verify_pin(path, cur, config.tpm2_tcti, &sso_secret);
+        memset(cur, 0, strlen(cur));
+        free(cur);
+        if (v != PINLOCK_VERIFY_OK) {
+            switch (v) {
+            case PINLOCK_VERIFY_FAIL:
+                fprintf(stderr, "Current PIN is incorrect.\n"); break;
+            case PINLOCK_VERIFY_LOCKOUT:
+                fprintf(stderr, "The TPM is in dictionary attack lockout; try again later.\n"); break;
+            case PINLOCK_VERIFY_UNREADABLE:
+                fprintf(stderr, "Cannot read the PIN record.\n"); break;
+            default:
+                fprintf(stderr, "The PIN record needs a TPM that is not usable right now.\n"); break;
+            }
+            free(user);
+            return 1;
+        }
+
+        int was_tpm = pinlock_record_type_of_file(path) == PINLOCK_RECORD_TPM2;
+        int was_sso = record_is_sso(path);
+        int had_secret = sso_secret != NULL;
+
+        char *p1 = prompt_new_pin(&config);
+        if (!p1) {
+            if (sso_secret) { memset(sso_secret, 0, strlen(sso_secret)); free(sso_secret); }
+            free(user);
+            return 1;
+        }
+        char *encoded = make_record(&config, p1, sso_secret, was_tpm);
+        if (sso_secret) { memset(sso_secret, 0, strlen(sso_secret)); free(sso_secret); }
+        memset(p1, 0, strlen(p1));
+        free(p1);
+        if (!encoded) {
+            free(user);
+            return 1;
+        }
+        if (write_file_restrict(dir, path, encoded, pw, system_pin_dir_enabled(&config)) != 0) die("write pin file");
+        free(encoded);
+        clear_rate_limit(dir, user);
+        printf("PIN changed for user '%s'\n", user);
+        if (was_sso && !had_secret)
+            printf("Note: the sealed account password could not be recovered; run\n"
+                   "'pinlockctl --tpm --sso set %s' to restore wallet unlocking.\n", user);
+        free(user);
+        return 0;
+    }
+
+    if (!strcmp(cmd, "reset")) {
+#ifdef HAVE_TPM2
+        if (ensure_dir(dir, pw, system_pin_dir_enabled(&config)) != 0) die("Cannot create PIN directory");
+        if (check_pin_dir_security(dir, pw, &config, 0) != 0) die("Unsafe PIN directory");
+
+        char *acct = prompt_hidden("Account password: ");
+        if (!acct || !*acct || verify_account_password(user, acct) != 0) {
+            fprintf(stderr, "That does not match the current account password; nothing was changed.\n");
+            if (acct) { memset(acct, 0, strlen(acct)); free(acct); }
+            free(user);
+            return 1;
+        }
+
+        // Keep the previous record's backend and sso choice unless
+        // flags say otherwise; a first-time reset defaults to the TPM
+        // when one is present.
+        int had = access(path, F_OK) == 0;
+        int tpm_backend = had ? pinlock_record_type_of_file(path) == PINLOCK_RECORD_TPM2
+                              : pinlock_tpm2_available(config.tpm2_tcti);
+        if (no_tpm) tpm_backend = 0;
+        if (use_tpm) tpm_backend = 1;
+        int want_sso = sso_flag == -1 ? (had && record_is_sso(path)) : sso_flag;
+
+        char *p1 = prompt_new_pin(&config);
+        if (!p1) {
+            memset(acct, 0, strlen(acct));
+            free(acct);
+            free(user);
+            return 1;
+        }
+        char *encoded = make_record(&config, p1, (want_sso && tpm_backend) ? acct : NULL, tpm_backend);
+        memset(p1, 0, strlen(p1));
+        free(p1);
+        memset(acct, 0, strlen(acct));
+        free(acct);
+        if (!encoded) {
+            free(user);
+            return 1;
+        }
+        if (write_file_restrict(dir, path, encoded, pw, system_pin_dir_enabled(&config)) != 0) die("write pin file");
+        free(encoded);
+        clear_rate_limit(dir, user);
+        printf("PIN reset for user '%s'\n", user);
+        free(user);
+        return 0;
+#else
+        fprintf(stderr, "reset needs a build with TPM support; use 'remove' and 'set' instead\n");
+        free(user);
+        return 1;
+#endif
+    }
+
     if (!strcmp(cmd, "enroll") || !strcmp(cmd, "set")) {
         if (ensure_dir(dir, pw, system_pin_dir_enabled(&config)) != 0) die("Cannot create PIN directory");
         if (check_pin_dir_security(dir, pw, &config, 0) != 0) die("Unsafe PIN directory");
@@ -679,46 +887,15 @@ int main(int argc, char **argv) {
         (void)sso_flag;
 #endif
 
-        char *p1 = prompt_hidden("Enter new PIN: ");
-        if (!p1 || !*p1) { 
-            fprintf(stderr, "No PIN entered.\n");
-            free(p1); free(user); return 1; 
-        }
-
-        // Validate PIN according to configuration
-        if (!validate_pin(p1, &config)) {
-            fprintf(stderr, "PIN does not meet requirements:\n");
-            fprintf(stderr, "  - Length: %d-%d characters\n", config.min_length, config.max_length);
-            if (config.require_digits_only) {
-                fprintf(stderr, "  - Must contain only digits (0-9)\n");
-            }
-            memset(p1, 0, strlen(p1));
-            free(p1); free(user);
+        char *p1 = prompt_new_pin(&config);
+        if (!p1) {
+            free(user);
             return 1;
         }
 
-        char *p2 = prompt_hidden("Confirm PIN: ");
-        if (!p2 || strcmp(p1,p2)!=0) { 
-            fprintf(stderr, "PINs do not match.\n");
-            memset(p1, 0, strlen(p1));
-            if (p2) memset(p2, 0, strlen(p2));
-            free(p1); free(p2); free(user); return 1; 
-        }
-
-        char *encoded = NULL;
-        if (use_tpm) {
+        char *sso_pw = NULL;
 #ifdef HAVE_TPM2
-            if (strlen(p1) > PINLOCK_TPM2_MAX_PIN) {
-                fprintf(stderr, "TPM-sealed PINs may be at most %d characters\n", PINLOCK_TPM2_MAX_PIN);
-                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-                free(p1); free(p2); free(user); return 1;
-            }
-            if (!pinlock_tpm2_available(config.tpm2_tcti)) {
-                fprintf(stderr, "No usable TPM 2.0 found (check tpm2_tcti in /etc/pinlock.conf and /dev/tpmrm0 access)\n");
-                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-                free(p1); free(p2); free(user); return 1;
-            }
-            char *sso_pw = NULL;
+        if (use_tpm) {
             int want_sso = sso_flag == 1;
             if (sso_flag == -1 && isatty(STDIN_FILENO)) {
                 fprintf(stderr, "Also seal your account password, so PIN sign-in unlocks KWallet\n");
@@ -734,42 +911,23 @@ int main(int argc, char **argv) {
                         || verify_account_password(user, sso_pw) != 0) {
                     fprintf(stderr, "That does not match the current account password; nothing was changed.\n");
                     if (sso_pw) { memset(sso_pw, 0, strlen(sso_pw)); free(sso_pw); }
-                    memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-                    free(p1); free(p2); free(user); return 1;
+                    memset(p1, 0, strlen(p1));
+                    free(p1); free(user);
+                    return 1;
                 }
             }
-            int seal_rc = pinlock_tpm2_seal(config.tpm2_tcti, p1, sso_pw, &encoded);
-            if (sso_pw) { memset(sso_pw, 0, strlen(sso_pw)); free(sso_pw); }
-            if (seal_rc != 0) {
-                fprintf(stderr, "Failed to seal PIN in the TPM\n");
-                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-                free(p1); free(p2); free(user); return 1;
-            }
-#else
-            fprintf(stderr, "This build has no TPM support (rebuild with TPM2=1 and tpm2-tss headers)\n");
-            memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-            free(p1); free(p2); free(user); return 1;
+        }
 #endif
-        } else {
-            int argon2_rc = 0;
-            int rc = pinlock_record_create_argon2(p1, &encoded, &argon2_rc);
-            if (rc == -1) die("urandom");
-            if (rc == -2) die("malloc");
-            if (rc != 0) {
-                fprintf(stderr, "Failed to hash PIN (argon2 error %d)\n", argon2_rc);
-                memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
-                free(p1); free(p2); free(user); return 1;
-            }
+        char *encoded = make_record(&config, p1, sso_pw, use_tpm);
+        if (sso_pw) { memset(sso_pw, 0, strlen(sso_pw)); free(sso_pw); }
+        memset(p1, 0, strlen(p1));
+        if (!encoded) {
+            free(p1); free(user);
+            return 1;
         }
 
         if (write_file_restrict(dir, path, encoded, pw, system_pin_dir_enabled(&config))!=0) die("write pin file");
-
-        // Clear any existing rate limiting data on successful PIN change
-        char rl_path[1024];
-        int rl_n = snprintf(rl_path, sizeof(rl_path), "%s/%s.ratelimit", dir, user);
-        if (rl_n < (int)sizeof(rl_path)) {
-            unlink(rl_path);  // ignore error
-        }
+        clear_rate_limit(dir, user);
 
         printf("PIN successfully set for user '%s'\n", user);
         printf("Configuration applied:\n");
@@ -779,8 +937,7 @@ int main(int argc, char **argv) {
         printf("  - Rate limiting: %d attempts per %d seconds\n", config.max_attempts, config.rate_limit_window);
         printf("  - PIN lockout: %s\n", config.enable_lockout ? "enabled" : "disabled");
 
-        memset(p1,0,strlen(p1)); memset(p2,0,strlen(p2));
-        free(p1); free(p2); free(encoded); free(user);
+        free(p1); free(encoded); free(user);
         return 0;
     }
 

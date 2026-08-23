@@ -261,11 +261,20 @@ Interactive enrollment detects the TPM automatically: when one is present, `pinl
 
 Why you might want this: PINs are short, so even a memory-hard hash cannot fully protect a stolen PIN file against offline guessing. A TPM-sealed record contains no hash at all. It can only be used on the physical TPM that created it, and the TPM's own dictionary attack lockout throttles wrong guesses in hardware, on top of the module's normal rate limiting. The PIN also never crosses the TPM bus in plaintext (verification uses salted, parameter-encrypted sessions).
 
-Unlocking KWallet and friends (`--sso`): a plain TPM record proves the PIN and nothing more, so anything encrypted with your account password (KWallet, GNOME Keyring) still prompts after a PIN sign-in. Enrolling with `pinlockctl --tpm --sso set alice` additionally seals your account password inside the same TPM record (it is verified against PAM first, so a typo cannot be sealed). On a successful PIN sign-in through a `forward_pass` stack, the module hands the real password to the rest of the stack, and password-derived secrets unlock exactly as if you had typed it. This mirrors how Windows Hello releases credentials from TPM-protected storage. Two things to know: change your account password and you must re-enroll (the PIN keeps working, but wallet unlocking silently stops until you do), and the sealed record then guards your actual password, so the PIN plus this machine's TPM are equivalent to knowing the password, which is the same tradeoff Windows Hello makes.
+Unlocking KWallet and friends (`--sso`): a plain TPM record proves the PIN and nothing more, so anything encrypted with your account password (KWallet, GNOME Keyring) still prompts after a PIN sign-in. Enrolling with `pinlockctl --tpm --sso set alice` additionally stores your account password in the record (it is verified against PAM first, so a typo cannot be stored). On a successful PIN sign-in through a `forward_pass` stack, the module hands the real password to the rest of the stack, and password-derived secrets unlock exactly as if you had typed it. This mirrors how Windows Hello releases credentials from TPM-protected storage. One thing to know: the record then guards your actual password, so the PIN plus this machine's TPM are equivalent to knowing the password, which is the same tradeoff Windows Hello makes.
+
+Internally the TPM seals a random key, the password is encrypted under that key, and a copy of the key is encrypted under the password itself. That last, deliberately circular wrap exists so a password change can rewrap the record using only the old password, with no PIN entry and no TPM round trip. Add the module to the password stack and this happens automatically on every `passwd` or desktop-driven password change:
+
+```
+# /etc/pam.d/common-password (Debian), directly before pam_permit.so
+password    optional    pam_pinlock.so
+```
+
+The module never blocks a password change; it logs whether the record was rewrapped. An administrative reset (`passwd alice` as root) provides no old password, so the record cannot follow; re-enroll with `--sso` afterwards, until then the PIN keeps working and only wallet unlocking is skipped.
 
 Requirements and behavior:
 
-- Build with tpm2-tss headers installed (Fedora: `tpm2-tss-devel`, Debian/Ubuntu: `libtss2-dev`, Arch: `tpm2-tss`). The Makefile auto-detects them; `make TPM2=0` builds without TPM support.
+- Build with tpm2-tss and OpenSSL headers installed (Fedora: `tpm2-tss-devel openssl-devel`, Debian/Ubuntu: `libtss2-dev libssl-dev`, Arch: `tpm2-tss openssl`). The Makefile auto-detects them; `make TPM2=0` builds without TPM support.
 - The process verifying the PIN needs access to the TPM device, normally `/dev/tpmrm0`. Root services (sudo, polkit) have it already. For user-run screen lockers the user may need membership in the `tss` group, depending on the distribution's udev rules.
 - TPM and argon2 records coexist freely. The record type is detected from the PIN file itself, so some users or services can use TPM sealing while others keep hashes.
 - TPM-sealed PINs are limited to 32 characters.
@@ -285,6 +294,13 @@ Sealing does not change file trust: anyone who can replace the PIN file can subs
 # Set up a new PIN (prompts for username if not specified)
 pinlockctl set [username]
 pinlockctl enroll alice      # Set PIN for user 'alice'
+
+# Change the PIN (asks for the current PIN; keeps the storage backend
+# and, for --sso records, the sealed account password)
+pinlockctl change alice
+
+# Forgot the PIN? Reset it with the account password
+pinlockctl reset alice
 
 # Check PIN status
 pinlockctl status [username]
