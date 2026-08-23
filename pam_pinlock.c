@@ -478,22 +478,41 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         if (prompt_pin(pamh, prompt, &pin) != PAM_SUCCESS)
             return PAM_AUTH_ERR;
 
+        // A greeter that distinguishes sign-in methods can tag the
+        // entry with a leading control byte: 0x01 means "this is a
+        // PIN" (must never be accepted as a password), 0x02 means
+        // "this is a password" (must never be verified as a PIN).
+        // Untagged entries keep the legacy behavior.
+        const char *entry = pin;
+        int entry_kind = 0;
+        if (pin[0] == '\x01') { entry_kind = 1; entry = pin + 1; }
+        else if (pin[0] == '\x02') { entry_kind = 2; entry = pin + 1; }
+
         // With forward_pass, hand the entry to the rest of the stack so
         // modules using try_first_pass consume it instead of prompting
         // again. Set before verification on purpose: a rejected or
-        // non-PIN entry (someone typing their password at the PIN
-        // prompt) then fails or succeeds downstream in the same attempt
-        // instead of stalling the conversation on a second prompt.
+        // non-PIN entry then fails or succeeds downstream in the same
+        // attempt instead of stalling the conversation on a second
+        // prompt. An explicit PIN entry is forwarded WITH its tag, so
+        // password modules can never accept it.
         if (forward_pass)
-            pam_set_item(pamh, PAM_AUTHTOK, pin);
+            pam_set_item(pamh, PAM_AUTHTOK, entry_kind == 1 ? pin : entry);
 
-        if (!validate_pin(pin, &config)) {
+        if (entry_kind == 2) {
+            // Explicit password entry: not ours to judge.
             memwipe(pin, strlen(pin));
             free(pin);
+            return PAM_IGNORE;
+        }
+
+        if (!validate_pin(entry, &config)) {
+            memwipe(pin, strlen(pin));
+            free(pin);
+            if (entry_kind == 1) return PAM_AUTH_ERR; // explicit PIN, wrong shape
             continue; // re-prompt
         }
 
-        int v = pinlock_verify_pin(pin_path, pin, config.tpm2_tcti);
+        int v = pinlock_verify_pin(pin_path, entry, config.tpm2_tcti);
         memwipe(pin, strlen(pin)); free(pin);
 
         if (v == PINLOCK_VERIFY_UNREADABLE)
@@ -530,6 +549,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
             pam_syslog(pamh, LOG_WARNING,
                        "pinlock: PIN incorrect for user %s, local attempt %d/%d",
                        user, attempt + 1, retries);
+        // An explicit PIN entry fails the module outright; it must not
+        // fall through to be tried as a password.
+        if (entry_kind == 1) return PAM_AUTH_ERR;
     }
 
     // By default, PIN exhaustion falls back to the next PAM method.
