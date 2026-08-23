@@ -49,6 +49,22 @@ pinlock_record_type_t pinlock_record_type(const char *first_line) {
     return PINLOCK_RECORD_UNKNOWN;
 }
 
+pinlock_record_type_t pinlock_record_type_of_file(const char *path) {
+    char first[256];
+#ifdef O_NOFOLLOW
+    int fd = open(path, O_RDONLY|O_NOFOLLOW);
+#else
+    int fd = open(path, O_RDONLY);
+#endif
+    if (fd < 0) return PINLOCK_RECORD_UNKNOWN;
+    ssize_t n = read(fd, first, sizeof(first) - 1);
+    close(fd);
+    if (n <= 0) return PINLOCK_RECORD_UNKNOWN;
+    first[n] = '\0';
+    first[strcspn(first, "\r\n")] = '\0';
+    return pinlock_record_type(first);
+}
+
 int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti) {
     char *text = NULL;
     if (read_record_file(path, &text) != 0 || !text) return PINLOCK_VERIFY_UNREADABLE;

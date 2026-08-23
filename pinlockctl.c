@@ -42,10 +42,12 @@ static void usage(const char *prog) {
     printf("Options:\n");
     printf("  --pin-dir DIR   Override PIN storage directory for this command\n");
     printf("  --tpm           Seal the PIN in the TPM instead of storing a hash (enroll/set)\n");
+    printf("  --no-tpm        Store a hash without offering TPM sealing (enroll/set)\n");
     printf("Commands:\n");
     printf("  enroll, set    Set a new PIN for the user\n");
     printf("  remove         Remove the PIN for the user\n");
     printf("  status         Show whether a PIN is set\n");
+    printf("  tpm-status     Show TPM availability and dictionary attack lockout state\n");
     printf("  unlock         Clear rate limiting/lockout for user\n");
     printf("  check          Check PIN storage configuration and permissions\n");
     printf("  config         Show current configuration\n");
@@ -392,6 +394,14 @@ static int show_storage_check(const char *user, const char *dir, const char *pat
     int dir_status = check_pin_dir_security(dir, pw, config, 1);
     int file_status = check_pin_file_security(path, pw, config, 1);
 
+    if (access(path, F_OK) == 0) {
+        switch (pinlock_record_type_of_file(path)) {
+        case PINLOCK_RECORD_TPM2:   printf("Record type: TPM-sealed\n"); break;
+        case PINLOCK_RECORD_ARGON2: printf("Record type: argon2id hash\n"); break;
+        default:                    printf("Record type: unrecognized or unreadable\n"); break;
+        }
+    }
+
     char rl_path[1024];
     int n = snprintf(rl_path, sizeof(rl_path), "%s/%s.ratelimit", dir, user);
     if (n >= 0 && n < (int)sizeof(rl_path)) {
@@ -450,10 +460,16 @@ int main(int argc, char **argv) {
 
     const char *pin_dir_override = NULL;
     int use_tpm = 0;
+    int no_tpm = 0;
     int cmd_index = 1;
     while (cmd_index < argc) {
         if (strcmp(argv[cmd_index], "--tpm") == 0) {
             use_tpm = 1;
+            cmd_index++;
+            continue;
+        }
+        if (strcmp(argv[cmd_index], "--no-tpm") == 0) {
+            no_tpm = 1;
             cmd_index++;
             continue;
         }
@@ -520,12 +536,46 @@ int main(int argc, char **argv) {
         return issues ? 1 : 0;
     }
 
+    if (!strcmp(cmd, "tpm-status")) {
+#ifdef HAVE_TPM2
+        pinlock_tpm2_da_info_t info;
+        if (pinlock_tpm2_da_info(config.tpm2_tcti, &info) != 0) {
+            printf("TPM 2.0: not available\n");
+        } else {
+            printf("TPM 2.0: available\n");
+            printf("  Dictionary attack lockout: %s\n",
+                   info.in_lockout ? "ACTIVE (PIN auth refused until recovery or admin clear)" : "not active");
+            printf("  Failed attempts counted: %u of %u\n", info.lockout_counter, info.max_auth_fail);
+            printf("  Counter decrement interval: %u seconds\n", info.lockout_interval);
+            printf("  Lockout recovery time: %u seconds\n", info.lockout_recovery);
+        }
+        if (access(path, F_OK) != 0) {
+            printf("PIN record for '%s': none\n", user);
+        } else switch (pinlock_record_type_of_file(path)) {
+        case PINLOCK_RECORD_TPM2:   printf("PIN record for '%s': TPM-sealed\n", user); break;
+        case PINLOCK_RECORD_ARGON2: printf("PIN record for '%s': argon2id hash\n", user); break;
+        default:                    printf("PIN record for '%s': unrecognized or unreadable\n", user); break;
+        }
+        free(user);
+        return 0;
+#else
+        fprintf(stderr, "This build has no TPM support (rebuild with TPM2=1 and tpm2-tss headers)\n");
+        free(user);
+        return 1;
+#endif
+    }
+
     if (!strcmp(cmd, "status")) {
         printf("PIN directory: %s\n", dir);
         int file_status = check_pin_file_security(path, pw, &config, 0);
         if (file_status == 0 && access(path, R_OK)==0) {
             printf("PIN enrolled for %s\n", user);
-            
+            switch (pinlock_record_type_of_file(path)) {
+            case PINLOCK_RECORD_TPM2:   printf("Storage backend: TPM-sealed record\n"); break;
+            case PINLOCK_RECORD_ARGON2: printf("Storage backend: argon2id hash\n"); break;
+            default:                    printf("Storage backend: unrecognized\n"); break;
+            }
+
             // Check if user is currently locked out
             char rl_path[1024];
             int rl_n = snprintf(rl_path, sizeof(rl_path), "%s/%s.ratelimit", dir, user);
@@ -565,6 +615,24 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "enroll") || !strcmp(cmd, "set")) {
         if (ensure_dir(dir, pw, system_pin_dir_enabled(&config)) != 0) die("Cannot create PIN directory");
         if (check_pin_dir_security(dir, pw, &config, 0) != 0) die("Unsafe PIN directory");
+
+#ifdef HAVE_TPM2
+        // Recommend TPM sealing when a TPM is present. Interactive
+        // sessions only, so piped enrollment keeps its current behavior.
+        if (!use_tpm && !no_tpm && isatty(STDIN_FILENO) &&
+            pinlock_tpm2_available(config.tpm2_tcti)) {
+            fprintf(stderr, "TPM 2.0 detected. Sealing the PIN in the TPM protects it against\n");
+            fprintf(stderr, "offline cracking if the PIN file is ever stolen (recommended).\n");
+            fprintf(stderr, "Seal the PIN in the TPM? [Y/n] ");
+            fflush(stderr);
+            char answer[16];
+            if (fgets(answer, sizeof(answer), stdin) &&
+                answer[0] != 'n' && answer[0] != 'N')
+                use_tpm = 1;
+        }
+#else
+        (void)no_tpm;
+#endif
 
         char *p1 = prompt_hidden("Enter new PIN: ");
         if (!p1 || !*p1) { 

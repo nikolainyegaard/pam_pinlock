@@ -89,6 +89,10 @@ static int b64_decode(const char *in, size_t inlen, uint8_t *out, size_t cap, si
 /* ---------- TPM plumbing ---------- */
 
 static TSS2_RC open_ctx(const char *tcti_conf, ESYS_CONTEXT **ctx, TSS2_TCTI_CONTEXT **tcti) {
+    // Keep tss2 library chatter off the caller's stderr; the PAM module
+    // can be running inside sudo or a screen locker. Export TSS2_LOG
+    // before the call to override for debugging.
+    setenv("TSS2_LOG", "all+NONE", 0);
     if (tcti_conf && !*tcti_conf) tcti_conf = NULL; // empty means library default
     TSS2_RC rc = Tss2_TctiLdr_Initialize(tcti_conf, tcti);
     if (rc != TSS2_RC_SUCCESS) return rc;
@@ -201,6 +205,37 @@ int pinlock_tpm2_available(const char *tcti_conf) {
     Esys_Free(cap);
     close_ctx(&ctx, &tcti);
     return rc == TSS2_RC_SUCCESS;
+}
+
+int pinlock_tpm2_da_info(const char *tcti_conf, pinlock_tpm2_da_info_t *info) {
+    memset(info, 0, sizeof(*info));
+
+    ESYS_CONTEXT *ctx = NULL;
+    TSS2_TCTI_CONTEXT *tcti = NULL;
+    if (open_ctx(tcti_conf, &ctx, &tcti) != TSS2_RC_SUCCESS) return -1;
+
+    TPMS_CAPABILITY_DATA *cap = NULL;
+    TSS2_RC rc = Esys_GetCapability(ctx, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                    TPM2_CAP_TPM_PROPERTIES, TPM2_PT_VAR, TPM2_MAX_TPM_PROPERTIES,
+                                    NULL, &cap);
+    close_ctx(&ctx, &tcti);
+    if (rc != TSS2_RC_SUCCESS || !cap) {
+        Esys_Free(cap);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < cap->data.tpmProperties.count; i++) {
+        const TPMS_TAGGED_PROPERTY *p = &cap->data.tpmProperties.tpmProperty[i];
+        switch (p->property) {
+        case TPM2_PT_LOCKOUT_COUNTER:  info->lockout_counter = p->value; break;
+        case TPM2_PT_MAX_AUTH_FAIL:    info->max_auth_fail = p->value; break;
+        case TPM2_PT_LOCKOUT_INTERVAL: info->lockout_interval = p->value; break;
+        case TPM2_PT_LOCKOUT_RECOVERY: info->lockout_recovery = p->value; break;
+        case TPM2_PT_PERMANENT:        info->in_lockout = (p->value & TPMA_PERMANENT_INLOCKOUT) != 0; break;
+        }
+    }
+    Esys_Free(cap);
+    return 0;
 }
 
 int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, char **record_out) {

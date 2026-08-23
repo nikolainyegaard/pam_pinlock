@@ -255,6 +255,10 @@ pinlockctl --tpm set alice
 sudo pinlockctl --tpm --pin-dir /var/lib/pinlock set alice
 ```
 
+Interactive enrollment detects the TPM automatically: when one is present, `pinlockctl set` asks whether to seal the PIN in it (recommended) or store a hash. Use `--tpm` or `--no-tpm` to skip the question. Piped or scripted enrollment never asks and stores a hash unless `--tpm` is given.
+
+`pinlockctl tpm-status [user]` shows whether a TPM is usable, the state of its dictionary attack lockout (attempt counter, threshold, recovery time), and which backend the user's PIN record uses. `status` and `check` also report the record type.
+
 Why you might want this: PINs are short, so even a memory-hard hash cannot fully protect a stolen PIN file against offline guessing. A TPM-sealed record contains no hash at all. It can only be used on the physical TPM that created it, and the TPM's own dictionary attack lockout throttles wrong guesses in hardware, on top of the module's normal rate limiting. The PIN also never crosses the TPM bus in plaintext (verification uses salted, parameter-encrypted sessions).
 
 Requirements and behavior:
@@ -282,7 +286,11 @@ pinlockctl enroll alice      # Set PIN for user 'alice'
 # Check PIN status
 pinlockctl status [username]
 # Output: PIN enrolled for alice
+#         Storage backend: argon2id hash
 #         Rate limiting data exists (check logs for lockout status)
+
+# Check TPM availability and dictionary attack lockout state
+pinlockctl tpm-status [username]
 
 # View current configuration
 pinlockctl config [username]

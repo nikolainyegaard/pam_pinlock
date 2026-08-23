@@ -14,10 +14,26 @@
 // A TPM PIN may not exceed the auth value limit of the sealed object.
 #define PINLOCK_TPM2_MAX_PIN 32
 
+#include <stdint.h>
+
 // Probe for a usable TPM. Returns 1 if available, 0 if not.
 // tcti_conf selects the TPM connection (NULL or empty for the library
 // default, typically /dev/tpmrm0).
 int pinlock_tpm2_available(const char *tcti_conf);
+
+// Dictionary attack state of the TPM. The counter and lockout are
+// chip-global, shared with every other user of this TPM.
+typedef struct {
+    int in_lockout;
+    uint32_t lockout_counter;   // failed auth attempts currently counted
+    uint32_t max_auth_fail;     // failures that trigger lockout
+    uint32_t lockout_interval;  // seconds until the counter decrements
+    uint32_t lockout_recovery;  // seconds until an active lockout clears
+} pinlock_tpm2_da_info_t;
+
+// Read the TPM's dictionary attack state. Returns 0 on success, -1 if
+// the TPM is unavailable.
+int pinlock_tpm2_da_info(const char *tcti_conf, pinlock_tpm2_da_info_t *info);
 
 // Seal a new PIN into a TPM record. On success stores heap-allocated
 // record text (header line plus base64 blob lines, newline-terminated)

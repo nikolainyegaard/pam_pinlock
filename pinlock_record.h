@@ -23,6 +23,10 @@ typedef enum {
 // Detect the record type from the first line of a PIN file.
 pinlock_record_type_t pinlock_record_type(const char *first_line);
 
+// Detect the record type stored at path without verifying anything.
+// Returns PINLOCK_RECORD_UNKNOWN if the file cannot be read.
+pinlock_record_type_t pinlock_record_type_of_file(const char *path);
+
 // Verify a PIN against the record stored at path. tpm2_tcti selects the
 // TPM connection for TPM records (NULL or empty for the library default).
 // Returns PINLOCK_VERIFY_OK; PINLOCK_VERIFY_FAIL for a wrong PIN or
