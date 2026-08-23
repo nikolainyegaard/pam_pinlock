@@ -14,6 +14,22 @@
 
 #define TPM2_SECRET_LEN 32
 
+// Creating the primary is by far the slowest TPM operation (hundreds of
+// ms on discrete chips), so enrollment persists the SRK and verification
+// reuses it. Two candidate slots: the conventional shared SRK location
+// (TCG provisioning guidance, also used by systemd) when it holds our
+// key, and pinlock's own slot when the shared one belongs to someone
+// else (a previous Windows install commonly leaves its RSA SRK there).
+// Verification falls back to a freshly created transient primary when
+// neither slot has the record's parent, so records always stay usable.
+#define PINLOCK_SRK_HANDLE_SHARED 0x81000001
+#define PINLOCK_SRK_HANDLE_OWN    0x8100F1CC
+
+// Own slot first: probing an empty slot is nearly free, but attempting
+// an unseal under a foreign key in the shared slot (the ex-Windows
+// case) costs a whole session plus a failed load on every auth.
+static const TPM2_HANDLE srk_slots[] = { PINLOCK_SRK_HANDLE_OWN, PINLOCK_SRK_HANDLE_SHARED };
+
 static void wipe(void *v, size_t n) {
 #if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2,25)
@@ -304,6 +320,43 @@ int pinlock_tpm2_seal(const char *tcti_conf, const char *pin, char **record_out)
     free(p64);
     free(s64);
 
+    // Best effort: make sure the SRK is persisted where verification
+    // will find it, so it skips the expensive primary creation. A slot
+    // holding a foreign key is left alone; skipping entirely is
+    // harmless (verification falls back to a transient primary).
+    if (ret == 0) {
+        TPM2B_NAME *primary_name = NULL;
+        if (Esys_TR_GetName(ctx, primary, &primary_name) == TSS2_RC_SUCCESS && primary_name) {
+            int found = 0;
+            TPM2_HANDLE free_slot = 0;
+            for (size_t i = 0; i < sizeof(srk_slots)/sizeof(srk_slots[0]) && !found; i++) {
+                ESYS_TR cand = ESYS_TR_NONE;
+                if (Esys_TR_FromTPMPublic(ctx, srk_slots[i],
+                                          ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                          &cand) != TSS2_RC_SUCCESS) {
+                    if (!free_slot) free_slot = srk_slots[i];
+                    continue;
+                }
+                TPM2B_NAME *cand_name = NULL;
+                if (Esys_TR_GetName(ctx, cand, &cand_name) == TSS2_RC_SUCCESS && cand_name
+                        && cand_name->size == primary_name->size
+                        && memcmp(cand_name->name, primary_name->name, cand_name->size) == 0)
+                    found = 1;
+                Esys_Free(cand_name);
+                Esys_TR_Close(ctx, &cand);
+            }
+            if (!found && free_slot) {
+                ESYS_TR persisted = ESYS_TR_NONE;
+                if (Esys_EvictControl(ctx, ESYS_TR_RH_OWNER, primary,
+                                      ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                                      free_slot, &persisted) == TSS2_RC_SUCCESS
+                        && persisted != ESYS_TR_NONE)
+                    Esys_TR_Close(ctx, &persisted);
+            }
+        }
+        Esys_Free(primary_name);
+    }
+
 out:
     wipe(&auth, sizeof(auth));
     wipe(&sens, sizeof(sens));
@@ -313,6 +366,45 @@ out:
     if (primary != ESYS_TR_NONE) Esys_FlushContext(ctx, primary);
     close_ctx(&ctx, &tcti);
     return ret;
+}
+
+// One unseal attempt under a given parent. Sets *load_integrity when
+// Load failed because the blob was not sealed under this parent key.
+static int unseal_under_parent(ESYS_CONTEXT *ctx, ESYS_TR parent,
+                               const TPM2B_PUBLIC *pub, const TPM2B_PRIVATE *priv,
+                               const TPM2B_AUTH *auth, int *load_integrity) {
+    *load_integrity = 0;
+    ESYS_TR session = ESYS_TR_NONE, obj = ESYS_TR_NONE;
+
+    TSS2_RC rc = make_session(ctx, parent, &session);
+    if (rc != TSS2_RC_SUCCESS) return classify_rc(rc);
+
+    rc = Esys_Load(ctx, parent, session, ESYS_TR_NONE, ESYS_TR_NONE, priv, pub, &obj);
+    if (rc != TSS2_RC_SUCCESS) {
+        Esys_FlushContext(ctx, session);
+        if (base_rc(rc) == TPM2_RC_INTEGRITY) *load_integrity = 1;
+        return base_rc(rc) == TPM2_RC_LOCKOUT
+            ? PINLOCK_VERIFY_LOCKOUT : PINLOCK_VERIFY_UNAVAILABLE;
+    }
+
+    rc = Esys_TR_SetAuth(ctx, obj, auth);
+    if (rc != TSS2_RC_SUCCESS) {
+        Esys_FlushContext(ctx, obj);
+        Esys_FlushContext(ctx, session);
+        return PINLOCK_VERIFY_UNAVAILABLE;
+    }
+
+    TPM2B_SENSITIVE_DATA *secret = NULL;
+    rc = Esys_Unseal(ctx, obj, session, ESYS_TR_NONE, ESYS_TR_NONE, &secret);
+    Esys_FlushContext(ctx, obj);
+    Esys_FlushContext(ctx, session);
+
+    if (rc == TSS2_RC_SUCCESS) {
+        wipe(secret->buffer, secret->size);
+        Esys_Free(secret);
+        return PINLOCK_VERIFY_OK;
+    }
+    return classify_rc(rc);
 }
 
 int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const char *pin) {
@@ -337,42 +429,34 @@ int pinlock_tpm2_verify(const char *tcti_conf, const char *record_text, const ch
     }
 
     int result = PINLOCK_VERIFY_UNAVAILABLE;
-    ESYS_TR primary = ESYS_TR_NONE, session = ESYS_TR_NONE, obj = ESYS_TR_NONE;
+    int load_integrity = 0;
+    ESYS_TR parent = ESYS_TR_NONE;
+
+    // Fast path: a persisted SRK. A slot that is empty or holds a key
+    // that is not the record's parent moves on to the next candidate;
+    // the transient primary is the last resort.
     TSS2_RC rc;
+    for (size_t i = 0; i < sizeof(srk_slots)/sizeof(srk_slots[0]); i++) {
+        rc = Esys_TR_FromTPMPublic(ctx, srk_slots[i],
+                                   ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &parent);
+        if (rc != TSS2_RC_SUCCESS) continue;
+        result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity);
+        Esys_TR_Close(ctx, &parent);
+        if (result != PINLOCK_VERIFY_UNAVAILABLE || !load_integrity)
+            goto out;
+    }
 
-    rc = make_primary(ctx, &primary);
-    if (rc != TSS2_RC_SUCCESS) { result = classify_rc(rc); goto out; }
-    rc = make_session(ctx, primary, &session);
-    if (rc != TSS2_RC_SUCCESS) { result = classify_rc(rc); goto out; }
-
-    rc = Esys_Load(ctx, primary, session, ESYS_TR_NONE, ESYS_TR_NONE, &priv, &pub, &obj);
+    parent = ESYS_TR_NONE;
+    rc = make_primary(ctx, &parent);
     if (rc != TSS2_RC_SUCCESS) {
-        // A record sealed by a different or since-cleared TPM fails
-        // here with TPM2_RC_INTEGRITY; that is unavailability, not a
-        // wrong PIN.
-        result = base_rc(rc) == TPM2_RC_LOCKOUT
-            ? PINLOCK_VERIFY_LOCKOUT : PINLOCK_VERIFY_UNAVAILABLE;
+        result = classify_rc(rc);
         goto out;
     }
-
-    rc = Esys_TR_SetAuth(ctx, obj, &auth);
-    if (rc != TSS2_RC_SUCCESS) goto out;
-
-    TPM2B_SENSITIVE_DATA *secret = NULL;
-    rc = Esys_Unseal(ctx, obj, session, ESYS_TR_NONE, ESYS_TR_NONE, &secret);
-    if (rc == TSS2_RC_SUCCESS) {
-        wipe(secret->buffer, secret->size);
-        Esys_Free(secret);
-        result = PINLOCK_VERIFY_OK;
-    } else {
-        result = classify_rc(rc);
-    }
+    result = unseal_under_parent(ctx, parent, &pub, &priv, &auth, &load_integrity);
+    Esys_FlushContext(ctx, parent);
 
 out:
     wipe(&auth, sizeof(auth));
-    if (obj != ESYS_TR_NONE) Esys_FlushContext(ctx, obj);
-    if (session != ESYS_TR_NONE) Esys_FlushContext(ctx, session);
-    if (primary != ESYS_TR_NONE) Esys_FlushContext(ctx, primary);
     close_ctx(&ctx, &tcti);
     return result;
 }
