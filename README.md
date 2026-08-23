@@ -384,6 +384,13 @@ auth    required    pam_unix.so
 auth    sufficient  pam_pinlock.so retries=1
 ```
 
+### Single-Prompt Stacks (forward_pass)
+```pam
+auth    sufficient                  pam_pinlock.so retries=1 forward_pass
+auth    [success=1 default=ignore]  pam_unix.so nullok try_first_pass
+```
+With `forward_pass`, whatever was typed at the PIN prompt is also handed to the rest of the stack, and modules using `try_first_pass` consume it instead of prompting again. This keeps every attempt to a single entry: a wrong PIN fails the whole attempt immediately, and a password typed at the PIN prompt still authenticates through the fallback in one go. Recommended for graphical greeters (SDDM, KDE lock screen), which otherwise stall on the second password prompt after a rejected PIN.
+
 ### Per-Service PIN Storage
 ```pam
 # Use root-managed storage for this PAM service only.

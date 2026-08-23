@@ -209,11 +209,13 @@ static void load_config(const char *user, pinlock_config_t *config) {
 }
 
 // Parse module args
-static void parse_args(int argc, const char **argv, const char **prompt, int *retries, pinlock_config_t *config) {
+static void parse_args(int argc, const char **argv, const char **prompt, int *retries, int *forward_pass, pinlock_config_t *config) {
     *prompt = NULL;
     *retries = 1;
+    *forward_pass = 0;
     for(int i=0;i<argc;i++) {
         if(strncmp(argv[i],"prompt=",7)==0) *prompt=argv[i]+7;
+        else if(strcmp(argv[i],"forward_pass")==0) *forward_pass=1;
         else if(strncmp(argv[i],"pin_dir=",8)==0) {
             const char *dir = argv[i]+8;
             if (!*dir || *dir == '/') snprintf(config->pin_dir, sizeof(config->pin_dir), "%s", dir);
@@ -422,7 +424,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     const char *prompt = NULL;
     int retries = 1;
-    parse_args(argc, argv, &prompt, &retries, &config);
+    int forward_pass = 0;
+    parse_args(argc, argv, &prompt, &retries, &forward_pass, &config);
     if (!prompt) prompt = "PIN: ";
 
     const char *dir = get_pinlock_dir(user, &config);
@@ -474,6 +477,15 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         char *pin = NULL;
         if (prompt_pin(pamh, prompt, &pin) != PAM_SUCCESS)
             return PAM_AUTH_ERR;
+
+        // With forward_pass, hand the entry to the rest of the stack so
+        // modules using try_first_pass consume it instead of prompting
+        // again. Set before verification on purpose: a rejected or
+        // non-PIN entry (someone typing their password at the PIN
+        // prompt) then fails or succeeds downstream in the same attempt
+        // instead of stalling the conversation on a second prompt.
+        if (forward_pass)
+            pam_set_item(pamh, PAM_AUTHTOK, pin);
 
         if (!validate_pin(pin, &config)) {
             memwipe(pin, strlen(pin));
