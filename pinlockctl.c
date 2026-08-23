@@ -13,6 +13,32 @@
 #include "pinlock_record.h"
 #ifdef HAVE_TPM2
 #include "pinlock_tpm2.h"
+#include <security/pam_appl.h>
+
+// PAM conversation that answers every prompt with the given password.
+static int pw_check_conv(int n, const struct pam_message **msg, struct pam_response **resp, void *data) {
+    struct pam_response *r = calloc((size_t)n, sizeof(*r));
+    if (!r) return PAM_CONV_ERR;
+    for (int i = 0; i < n; i++) {
+        if (msg[i]->msg_style == PAM_PROMPT_ECHO_OFF || msg[i]->msg_style == PAM_PROMPT_ECHO_ON)
+            r[i].resp = strdup((const char *)data);
+    }
+    *resp = r;
+    return PAM_SUCCESS;
+}
+
+// Verify the account password before sealing it: a sealed typo would
+// quietly break wallet unlocking on every PIN sign-in.
+static int verify_account_password(const char *user, const char *password) {
+    struct stat st;
+    const char *service = stat("/etc/pam.d/sshd", &st) == 0 ? "sshd" : "login";
+    struct pam_conv conv = { pw_check_conv, (void *)password };
+    pam_handle_t *pamh = NULL;
+    if (pam_start(service, user, &conv, &pamh) != PAM_SUCCESS) return -1;
+    int rc = pam_authenticate(pamh, PAM_SILENT);
+    pam_end(pamh, rc);
+    return rc == PAM_SUCCESS ? 0 : -1;
+}
 #endif
 
 // Configuration structure (same as PAM module)
@@ -43,6 +69,8 @@ static void usage(const char *prog) {
     printf("  --pin-dir DIR   Override PIN storage directory for this command\n");
     printf("  --tpm           Seal the PIN in the TPM instead of storing a hash (enroll/set)\n");
     printf("  --no-tpm        Store a hash without offering TPM sealing (enroll/set)\n");
+    printf("  --sso           Also seal the account password so PIN sign-in unlocks KWallet (with --tpm)\n");
+    printf("  --no-sso        Never offer to seal the account password\n");
     printf("Commands:\n");
     printf("  enroll, set    Set a new PIN for the user\n");
     printf("  remove         Remove the PIN for the user\n");
@@ -461,6 +489,7 @@ int main(int argc, char **argv) {
     const char *pin_dir_override = NULL;
     int use_tpm = 0;
     int no_tpm = 0;
+    int sso_flag = -1; // -1 ask (interactive only), 0 never, 1 yes
     int cmd_index = 1;
     while (cmd_index < argc) {
         if (strcmp(argv[cmd_index], "--tpm") == 0) {
@@ -470,6 +499,16 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[cmd_index], "--no-tpm") == 0) {
             no_tpm = 1;
+            cmd_index++;
+            continue;
+        }
+        if (strcmp(argv[cmd_index], "--sso") == 0) {
+            sso_flag = 1;
+            cmd_index++;
+            continue;
+        }
+        if (strcmp(argv[cmd_index], "--no-sso") == 0) {
+            sso_flag = 0;
             cmd_index++;
             continue;
         }
@@ -637,6 +676,7 @@ int main(int argc, char **argv) {
         }
 #else
         (void)no_tpm;
+        (void)sso_flag;
 #endif
 
         char *p1 = prompt_hidden("Enter new PIN: ");
@@ -678,7 +718,29 @@ int main(int argc, char **argv) {
                 memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
                 free(p1); free(p2); free(user); return 1;
             }
-            if (pinlock_tpm2_seal(config.tpm2_tcti, p1, &encoded) != 0) {
+            char *sso_pw = NULL;
+            int want_sso = sso_flag == 1;
+            if (sso_flag == -1 && isatty(STDIN_FILENO)) {
+                fprintf(stderr, "Also seal your account password, so PIN sign-in unlocks KWallet\n");
+                fprintf(stderr, "and other password-protected secrets? [y/N] ");
+                fflush(stderr);
+                char answer[16];
+                if (fgets(answer, sizeof(answer), stdin) && (answer[0] == 'y' || answer[0] == 'Y'))
+                    want_sso = 1;
+            }
+            if (want_sso) {
+                sso_pw = prompt_hidden("Account password: ");
+                if (!sso_pw || !*sso_pw || strlen(sso_pw) > PINLOCK_TPM2_MAX_SSO
+                        || verify_account_password(user, sso_pw) != 0) {
+                    fprintf(stderr, "That does not match the current account password; nothing was changed.\n");
+                    if (sso_pw) { memset(sso_pw, 0, strlen(sso_pw)); free(sso_pw); }
+                    memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
+                    free(p1); free(p2); free(user); return 1;
+                }
+            }
+            int seal_rc = pinlock_tpm2_seal(config.tpm2_tcti, p1, sso_pw, &encoded);
+            if (sso_pw) { memset(sso_pw, 0, strlen(sso_pw)); free(sso_pw); }
+            if (seal_rc != 0) {
                 fprintf(stderr, "Failed to seal PIN in the TPM\n");
                 memset(p1, 0, strlen(p1)); memset(p2, 0, strlen(p2));
                 free(p1); free(p2); free(user); return 1;

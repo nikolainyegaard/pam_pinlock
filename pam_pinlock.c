@@ -512,8 +512,19 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
             continue; // re-prompt
         }
 
-        int v = pinlock_verify_pin(pin_path, entry, config.tpm2_tcti);
+        char *sso_secret = NULL;
+        int v = pinlock_verify_pin(pin_path, entry, config.tpm2_tcti, &sso_secret);
         memwipe(pin, strlen(pin)); free(pin);
+
+        // A record with a sealed account password unlocks
+        // password-derived secrets (KWallet and friends): the modules
+        // behind us get the real password as if the user had typed it.
+        if (sso_secret) {
+            if (v == PINLOCK_VERIFY_OK && forward_pass)
+                pam_set_item(pamh, PAM_AUTHTOK, sso_secret);
+            memwipe(sso_secret, strlen(sso_secret));
+            free(sso_secret);
+        }
 
         if (v == PINLOCK_VERIFY_UNREADABLE)
             return PAM_IGNORE;

@@ -261,6 +261,8 @@ Interactive enrollment detects the TPM automatically: when one is present, `pinl
 
 Why you might want this: PINs are short, so even a memory-hard hash cannot fully protect a stolen PIN file against offline guessing. A TPM-sealed record contains no hash at all. It can only be used on the physical TPM that created it, and the TPM's own dictionary attack lockout throttles wrong guesses in hardware, on top of the module's normal rate limiting. The PIN also never crosses the TPM bus in plaintext (verification uses salted, parameter-encrypted sessions).
 
+Unlocking KWallet and friends (`--sso`): a plain TPM record proves the PIN and nothing more, so anything encrypted with your account password (KWallet, GNOME Keyring) still prompts after a PIN sign-in. Enrolling with `pinlockctl --tpm --sso set alice` additionally seals your account password inside the same TPM record (it is verified against PAM first, so a typo cannot be sealed). On a successful PIN sign-in through a `forward_pass` stack, the module hands the real password to the rest of the stack, and password-derived secrets unlock exactly as if you had typed it. This mirrors how Windows Hello releases credentials from TPM-protected storage. Two things to know: change your account password and you must re-enroll (the PIN keeps working, but wallet unlocking silently stops until you do), and the sealed record then guards your actual password, so the PIN plus this machine's TPM are equivalent to knowing the password, which is the same tradeoff Windows Hello makes.
+
 Requirements and behavior:
 
 - Build with tpm2-tss headers installed (Fedora: `tpm2-tss-devel`, Debian/Ubuntu: `libtss2-dev`, Arch: `tpm2-tss`). The Makefile auto-detects them; `make TPM2=0` builds without TPM support.

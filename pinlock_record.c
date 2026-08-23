@@ -65,7 +65,8 @@ pinlock_record_type_t pinlock_record_type_of_file(const char *path) {
     return pinlock_record_type(first);
 }
 
-int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti) {
+int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti, char **sso_secret_out) {
+    if (sso_secret_out) *sso_secret_out = NULL;
     char *text = NULL;
     if (read_record_file(path, &text) != 0 || !text) return PINLOCK_VERIFY_UNREADABLE;
 
@@ -84,7 +85,7 @@ int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti)
         break;
     case PINLOCK_RECORD_TPM2:
 #ifdef HAVE_TPM2
-        result = pinlock_tpm2_verify(tpm2_tcti, text, pin);
+        result = pinlock_tpm2_verify(tpm2_tcti, text, pin, sso_secret_out);
 #else
         (void)tpm2_tcti;
         result = PINLOCK_VERIFY_UNAVAILABLE;

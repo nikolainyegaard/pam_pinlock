@@ -13,7 +13,7 @@ ifeq ($(TPM2),1)
     TPM2_LIBS = $(shell pkg-config --libs $(TPM2_PCDEPS))
     TPM2_SRC = pinlock_tpm2.c
     PAM_LIBS += $(TPM2_LIBS)
-    CTL_LIBS += $(TPM2_LIBS)
+    CTL_LIBS += $(TPM2_LIBS) -lpam
 endif
 
 # Installation directories - auto-detect or use common defaults

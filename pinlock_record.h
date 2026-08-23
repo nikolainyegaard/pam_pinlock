@@ -11,8 +11,11 @@ typedef enum {
     PINLOCK_RECORD_UNKNOWN,
 } pinlock_record_type_t;
 
-// First line of a TPM-backed record file.
+// First line of a TPM-backed record file. The sso variant marks a
+// record whose sealed payload is the account password rather than a
+// random secret.
 #define PINLOCK_TPM2_HEADER "pinlock-tpm2 v1"
+#define PINLOCK_TPM2_HEADER_SSO "pinlock-tpm2 v1 sso"
 
 #define PINLOCK_VERIFY_OK           0
 #define PINLOCK_VERIFY_FAIL         1
@@ -34,7 +37,10 @@ pinlock_record_type_t pinlock_record_type_of_file(const char *path);
 // attack lockout; PINLOCK_VERIFY_UNREADABLE if the record cannot be read;
 // PINLOCK_VERIFY_UNAVAILABLE if the record needs a TPM that cannot be
 // used (unreachable, cleared since enrollment, or support not built in).
-int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti);
+// On success with a record carrying a sealed account password, stores it
+// (heap-allocated, NUL-terminated) in *sso_secret_out if non-NULL; the
+// caller must wipe and free it.
+int pinlock_verify_pin(const char *path, const char *pin, const char *tpm2_tcti, char **sso_secret_out);
 
 // Create an argon2id record string for a new PIN. On success stores a
 // heap-allocated encoded string in *encoded_out (caller frees) and
